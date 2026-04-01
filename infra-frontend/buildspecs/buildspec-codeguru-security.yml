@@ -1,0 +1,199 @@
+version: 0.2
+
+env:
+  variables:
+    MAX_HIGH_SEVERITY_FINDINGS: 1
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      
+     - |
+        
+        echo "Current branch $BRANCH"
+
+        # Check if dev branch and install AWS CLI if true
+        if [ "$BRANCH" = "dev" ]; then
+        echo "On dev branch, installing AWS CLI..."
+        yum install -y zip
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install
+        aws --version
+        else
+        echo "Not on dev branch, skipping AWS CLI installation"
+        echo "Moving to next stage..."
+        fi
+
+  pre_build:
+    commands:
+      - echo "Preparing for CodeGuru Security Scan"
+      - SCAN_NAME="${REPOSITORY_NAME}-${BRANCH}"
+
+  build:
+    commands:
+    - |
+        if [ "$BRANCH" = "dev" ]; then
+          # Install dependencies for dev branch
+          yum install -y zip
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+          aws --version
+
+          echo "Preparing for CodeGuru Security Scan"
+          SCAN_NAME="${REPOSITORY_NAME}-${BRANCH}"
+
+          # Create ZIP archive
+          echo "Archiving project files"
+          zip -r amazon-codeguru-security-input.zip . -x "*.git*" "*.zip"
+          ls
+          
+          echo $REPOSITORY_NAME
+          echo $BRANCH
+          SCAN_NAME="${REPOSITORY_NAME}-${BRANCH}"
+          echo $SCAN_NAME
+          
+          # Get S3 upload URL
+          echo "Getting CodeGuru Security upload URL"
+          UPLOAD_INFO=$(aws codeguru-security create-upload-url --scan-name "$SCAN_NAME")
+          export S3_URL=$(echo "$UPLOAD_INFO" | jq -r '.s3Url')
+          echo $S3_URL
+          export CODE_ARTIFACT_ID=$(echo "$UPLOAD_INFO" | jq -r '.codeArtifactId')
+          RESOURCE_ID=$(echo "$S3_URL" | awk -F '/' '{print $4}')
+          echo $RESOURCE_ID
+          echo $CODE_ARTIFACT_ID
+
+          # Extract headers
+          HEADER_1_KEY=$(echo "$UPLOAD_INFO" | jq -r '.requestHeaders | to_entries[0].key')
+          HEADER_1_VALUE=$(echo "$UPLOAD_INFO" | jq -r '.requestHeaders | to_entries[0].value')
+          HEADER_2_KEY=$(echo "$UPLOAD_INFO" | jq -r '.requestHeaders | to_entries[1].key')
+          HEADER_2_VALUE=$(echo "$UPLOAD_INFO" | jq -r '.requestHeaders | to_entries[1].value')
+
+          echo $HEADER_1_KEY
+          echo $HEADER_1_VALUE
+          echo $HEADER_2_KEY
+          echo $HEADER_2_VALUE
+          
+          # Upload ZIP to S3
+          echo "Uploading code artifact to S3"
+          curl -X PUT -T amazon-codeguru-security-input.zip \
+            -H "${HEADER_1_KEY}: ${HEADER_1_VALUE}" \
+            -H "${HEADER_2_KEY}: ${HEADER_2_VALUE}" \
+            "${S3_URL}"
+       
+          SCAN_INFO=$(aws codeguru-security create-scan --scan-name "$SCAN_NAME" --resource-id "{\"codeArtifactId\":\"${CODE_ARTIFACT_ID}\"}")
+          echo "SCAN_INFO $SCAN_INFO"
+          
+          # Extract Run ID
+          export RUN_ID=$(echo "$SCAN_INFO" | jq -r '.runId')
+          echo "Scan Run ID $RUN_ID"
+          
+          # Wait for scan completion
+          while true; do
+            SCAN_STATE=$(aws codeguru-security get-scan \
+              --scan-name "$SCAN_NAME" \
+              --run-id "$RUN_ID" \
+              --query "scanState" \
+              --output text)
+            
+            if [ "$SCAN_STATE" == "Completed" ] || [ "$SCAN_STATE" == "Successful" ]; then
+              echo "CodeGuru Security scan completed successfully."
+              break
+            elif [ "$SCAN_STATE" == "Failed" ]; then
+              echo "CodeGuru Security scan failed."
+              exit 1
+            else
+              echo "Current scan state: $SCAN_STATE. Waiting for completion..."
+            fi
+            sleep 10
+          done
+
+          # Process findings
+          echo "Retrieving scan findings"
+          FINDINGS=$(aws codeguru-security get-findings --scan-name "$SCAN_NAME")
+
+          # Calculate statistics
+          echo "Calculating severity statistics"
+          SEVERITY_STATS=$(echo "$FINDINGS" | jq '
+            .findings | 
+            group_by(.severity) | 
+            map({(.[0].severity): length}) | 
+            reduce .[] as $item ({"Total": 0}; 
+              . * $item + {"Total": .Total + ($item | values | add)})
+          ')
+          echo "Severity Statistics: $SEVERITY_STATS"
+          
+          
+
+          # Generate reports
+          echo "CodeGuru Security scan completed"
+          aws codeguru-security get-findings --scan-name "$SCAN_NAME" > codeguru-security-results.json
+          cat codeguru-security-results.json
+
+          echo "Analyzing findings..."
+          HIGH_COUNT=$(jq '[.findings[] | select(.severity == "High")] | length' codeguru-security-results.json)
+          MEDIUM_COUNT=$(jq '[.findings[] | select(.severity == "Medium")] | length' codeguru-security-results.json)
+          LOW_COUNT=$(jq '[.findings[] | select(.severity == "Low")] | length' codeguru-security-results.json)
+          TOTAL_COUNT=$(jq '.findings | length' codeguru-security-results.json)
+
+          echo "Security Issues Summary:"
+          echo "High Severity Issues: $HIGH_COUNT"
+          echo "Medium Severity Issues: $MEDIUM_COUNT"
+          echo "Low Severity Issues: $LOW_COUNT"
+          echo "Total number of findings: $TOTAL_COUNT"
+
+          # Check failures
+          check_failures() {
+            local fail=0
+            local message="due to:\n"
+
+            [ "$TOTAL_COUNT" -ge 10 ] && { message+="  - Total recommendations reached or exceeded threshold (5) found $TOTAL_COUNT\n"; fail=1; }
+            [ "$HIGH_COUNT" -ge 5 ] && { message+="  - High severity issues reached or exceeded threshold (1) found $HIGH_COUNT\n"; fail=1; }
+            [ "$MEDIUM_COUNT" -ge 7 ] && { message+="  - Medium severity issues reached or exceeded threshold (3) found $MEDIUM_COUNT\n"; fail=1; }
+            [ "$LOW_COUNT" -ge 3 ] && { message+="  - Low severity issues reached or exceeded threshold (2) found $LOW_COUNT\n"; fail=1; }
+
+            if [ $fail -eq 1 ]; then
+              echo -e "CodeGuru Review Failed for the following reasons:\n$message"
+              echo "Please address the above issues."
+              exit 1
+            else
+              echo "CodeGuru Security Passed: All metrics are within thresholds."
+            fi
+          }
+
+          check_failures
+
+          # Generate summary
+          echo "Generating findings summary"
+          jq '
+            .findings | 
+            group_by(.severity) | 
+            map({
+              severity: .[0].severity, 
+              count: length, 
+              rules: [.[].ruleId] | unique
+            })
+          ' codeguru-security-results.json > findings_summary.json
+
+          cat findings_summary.json
+        else
+          echo "Not on dev branch, skipping CodeGuru Security scan"
+          echo "Creating empty result files for artifacts"
+          echo '{"findings": []}' > codeguru-security-results.json
+          echo '[]' > findings_summary.json
+        fi
+
+artifacts:
+  files:
+    - codeguru-security-results.json
+    - findings_summary.json
+    # - high_severity_findings.json  # Only generated if high severity findings exist
+
+reports:
+  codeguru-security-report:
+    files:
+      - codeguru-security-results.json
+    file-format: SARIF

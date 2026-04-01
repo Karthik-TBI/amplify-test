@@ -1,0 +1,68 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Downloading and installing Terraform..."
+      - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_amd64.zip
+      - unzip terraform.zip
+      - mv terraform /usr/local/bin/
+      # - sudo yum install -y yum-utils shadow-utils
+      # - sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+      # - sudo yum -y install terraform
+      - terraform --version  # Verify Terraform installation
+      - cd modules/lambda/layers/cognito-trigger/nodejs
+      - npm install
+      - cd ../../../../../
+  pre_build:
+    commands:
+      - echo "Terraform execution started on `date`"
+      - echo "Current working directory $(pwd)"
+      - ls -la
+
+  build:
+    commands:
+      - echo "Copying backend configuration"
+      - cp $ENV_DIR/backend.tf .
+      - ls
+      - terraform init
+      - terraform apply -var-file=$ENV_DIR/terraform.tfvars -auto-approve 
+
+
+
+      - echo "Assuming role for ${ENVIRONMENT} environment..."
+      - |
+        if [[ "${ENVIRONMENT}" == "dev" ]]; then
+          export DEPLOYMENT_ROLE_ARN="arn:aws:iam::767397709508:role/pw-role-dev-crossaccount_infra_role";
+        elif [[ "${ENVIRONMENT}" == "uat" ]]; then
+          export DEPLOYMENT_ROLE_ARN="arn:aws:iam::891377117055:role/pw-role-uat-crossaccount_infra_role";
+        elif [[ "${ENVIRONMENT}" == "prod" ]]; then
+          export DEPLOYMENT_ROLE_ARN="arn:aws:iam::123456789012:role/pw-role-prod-crossaccount_infra_role";
+        else
+          echo "Unknown environment: ${ENVIRONMENT}";
+          exit 1;
+        fi
+
+      - CREDENTIALS=$(aws sts assume-role --role-arn ${DEPLOYMENT_ROLE_ARN} --role-session-name EKSDeploySession --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+      - export AWS_ACCESS_KEY_ID=$(echo $CREDENTIALS | cut -d' ' -f1)
+      - export AWS_SECRET_ACCESS_KEY=$(echo $CREDENTIALS | cut -d' ' -f2)
+      - export AWS_SESSION_TOKEN=$(echo $CREDENTIALS | cut -d' ' -f3)
+
+      - echo "Logging in to AWS to verify assumed role..."
+      - aws sts get-caller-identity
+
+
+      # invoking the lambda function
+
+
+      - aws lambda list-functions
+      - aws lambda invoke --function-name pw-lambda-${ENVIRONMENT}-sign-in-trigger-update --payload '{}' output.json
+      # - cat output.json
+      # - aws lambda invoke --function-name pw-lambda-${ENVIRONMENT}-cognito-sign-in-trigger --payload '{}' --cli-binary-format raw-in-base64-out --log-type Tail output.json
+      
+
+
+artifacts:
+  files:
+    - $ENV_DIR/**/*
+  name: terraform-apply-artifact
